@@ -7,32 +7,36 @@
 //
 
 import Foundation
+import HealthKit
 
 /// The entry point to the SDK
 public final class DigiMe {
-    
+
     public var isDownloadingFiles: Bool {
         return self.downloadService.isDownloadingFiles
     }
 
     private let configuration: Configuration
-    
+
     private let authService: OAuthService
     private let consentManager: ConsentManager
     private let sessionCache: SessionCache
+    private let contractsCache: ContractsCache
     private let apiClient: APIClient
     private let dataDecryptor: DataDecryptor
-    
+    private let healthDataClient: HealthDataClient
+    private let certificateParser: CertificateParser
+
     private lazy var downloadService: FileDownloadService = {
         FileDownloadService(apiClient: apiClient, dataDecryptor: dataDecryptor)
     }()
-    
+
     private lazy var uploadService: FileUploadService = {
         FileUploadService(apiClient: apiClient, configuration: configuration)
     }()
-    
+
     @Atomic private var allFilesReader: AllFilesReader?
-    
+
     private var session: Session? {
         get {
             sessionCache.session(for: configuration.contractId)
@@ -41,7 +45,7 @@ public final class DigiMe {
             sessionCache.setSession(newValue, for: configuration.contractId)
         }
     }
-    
+
     /// The log levels for all `DigiMe` instances which will be included in logs.
     /// Defaults to `[.info, .warning, .error, .critical]`
     public class var logLevels: [LogLevel] {
@@ -52,26 +56,29 @@ public final class DigiMe {
             Logger.logLevels = newValue
         }
     }
-    
+
     /// Sets the custom log handler for all `DigiMe` instances to allow logging to a different system.
     /// DigiMeSDK uses `NSLog` by default.
     /// - Parameter handler: The log handler block
     public class func setLogHandler(_ handler: @escaping LogHandler) {
         Logger.setLogHandler(handler)
     }
-    
+
     /// Initialises a new instance of SDK.
     /// A new instance should be created for each contract the app uses
     /// - Parameter configuration: The configuration which defines this instance
     public init(configuration: Configuration) {
         self.configuration = configuration
-		self.apiClient = APIClient(with: configuration.baseUrl)
+        self.apiClient = APIClient()
         self.authService = OAuthService(configuration: configuration, apiClient: apiClient)
         self.consentManager = ConsentManager(configuration: configuration)
         self.sessionCache = SessionCache()
+        self.contractsCache = ContractsCache()
         self.dataDecryptor = DataDecryptor(configuration: configuration)
+        self.healthDataClient = HealthDataClient(healthService: HealthDataService(account: HealthDataAccount().account))
+        self.certificateParser = CertificateParser()
     }
-    
+
     /// Authorizes the contract configured with this digi.me instance to access to a library.
     ///
     /// Requires `CallbackService.shared().handleCallback(url:)` to be called from appropriate in `AppDelegate` or `SceneDelegate`place so that authorization can complete.
@@ -99,21 +106,21 @@ public final class DigiMe {
             }
             return
         }
-        
+
         validateOrRefreshCredentials(credentials) { result in
             switch result {
             case .success(let refreshedCredentials):
                 resultQueue.async {
                     completion(.success(refreshedCredentials))
                 }
-                
+
             case .failure(SDKError.authorizationRequired):
                 self.beginAuth(serviceId: serviceId, readOptions: readOptions, linkToContractWithCredentials: linkCredentials) { authResult in
                     resultQueue.async {
                         completion(authResult)
                     }
                 }
-                
+
             case .failure(let error):
                 resultQueue.async {
                     completion(.failure(error))
@@ -121,7 +128,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     /// Once a user has granted consent, adds an additional service. Also initiates synchronization of data from this service to user's library.
     ///
     /// - Parameters:
@@ -133,24 +140,24 @@ public final class DigiMe {
         validateOrRefreshCredentials(credentials) { result in
             switch result {
             case .success(let refreshedCredentials):
-            self.authService.requestReferenceToken(oauthToken: refreshedCredentials.token) { result in
-                switch result {
-                case .success(let response):
-                    self.session = response.session
-                    self.consentManager.addService(identifier: identifier, token: response.token) { result in
-                        let mappedResult = result.map { refreshedCredentials }
+                self.authService.requestReferenceToken(oauthToken: refreshedCredentials.token) { result in
+                    switch result {
+                    case .success(let response):
+                        self.session = response.session
+                        self.consentManager.addService(identifier: identifier, token: response.token) { result in
+                            let mappedResult = result.map { refreshedCredentials }
+                            resultQueue.async {
+                                completion(mappedResult)
+                            }
+                        }
+
+                    case .failure(let error):
                         resultQueue.async {
-                            completion(mappedResult)
+                            completion(.failure(error))
                         }
                     }
-                
-                case .failure(let error):
-                    resultQueue.async {
-                        completion(.failure(error))
-                    }
                 }
-            }
-                
+
             case .failure(let error):
                 resultQueue.async {
                     completion(.failure(error))
@@ -158,7 +165,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     /// Reads the service data source accounts user has added to library related to the configured contract.
     ///
     /// Requires a valid session to have been created, either implicitly by adding a new service, or explicitly by calling `requestDataQuery(credentials:readOptions:resultQueue:completion)`.
@@ -174,14 +181,14 @@ public final class DigiMe {
             session.isValid else {
             return completion(.failure(.invalidSession))
         }
-        
+
         readAccounts(session: session) { result in
             resultQueue.async {
                 completion(result)
             }
         }
     }
-    
+
     /// Fetches content for all the files limited by read options.
     ///
     /// An attempt is made to fetch each requested file and the result of the attempt is passed back via the download handler.
@@ -210,9 +217,9 @@ public final class DigiMe {
             }
             return
         }
-        
+
         allFilesReader = AllFilesReader(apiClient: self.apiClient, configuration: self.configuration)
-        
+
         allFilesReader?.readAllFiles(downloadHandler: { result in
             resultQueue.async {
                 downloadHandler(result)
@@ -232,7 +239,7 @@ public final class DigiMe {
                                 completion(result.map { ($0, refreshedCredentials) })
                             }
                         })
-                        
+
                     case .failure(let error):
                         self.allFilesReader = nil
                         resultQueue.async {
@@ -240,17 +247,17 @@ public final class DigiMe {
                         }
                     }
                 }
-                
+
                 return
             }
-            
+
             self.allFilesReader = nil
             resultQueue.async {
                 completion(result.map { ($0, credentials) })
             }
         })
     }
-    
+
     /// Creates a session during which files can be read. This session is typically valid for 15 minutes.
     /// Once it has expired, a new session will be required to continue reading data.
     ///
@@ -270,7 +277,7 @@ public final class DigiMe {
                         completion(result.map { refreshedCredentials })
                     }
                 }
-                
+
             case .failure(let error):
                 resultQueue.async {
                     completion(.failure(error))
@@ -278,7 +285,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     /// Retrieves a list of files contained within the user's library.
     ///
     /// Requires a valid session to have been created, either implicitly by adding a new service, or explicitly by calling `requestDataQuery(credentials:readOptions:resultQueue:completion)`.
@@ -296,14 +303,14 @@ public final class DigiMe {
             session.isValid else {
             return completion(.failure(.invalidSession))
         }
-        
+
         apiClient.makeRequest(FileListRoute(sessionKey: session.key)) { result in
             resultQueue.async {
                 completion(result)
             }
         }
     }
-    
+
     /// Retrieves the content of a specified file.
     ///
     /// Requires a valid session to have been created, either implicitly by adding a new service, or explicitly by calling `requestDataQuery(credentials:readOptions:resultQueue:completion)`.
@@ -318,14 +325,14 @@ public final class DigiMe {
             session.isValid else {
             return completion(.failure(.invalidSession))
         }
-        
+
         downloadService.downloadFile(sessionKey: session.key, fileId: fileId) { result in
             resultQueue.async {
                 completion(result)
             }
         }
     }
-    
+
     /// Writes data to user's library associated with configured contract
     /// - Parameters:
     ///   - data: The data to be written
@@ -344,7 +351,7 @@ public final class DigiMe {
             }
             return
         }
-        
+
         validateOrRefreshCredentials(credentials) { result in
             switch result {
             case .success(let refreshedCredentials):
@@ -353,7 +360,7 @@ public final class DigiMe {
                         completion(result)
                     }
                 }
-            
+
             case .failure(let error):
                 resultQueue.async {
                     completion(.failure(error))
@@ -361,7 +368,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     /// Deletes the user's library associated with the configured contract.
     ///
     /// Please note that if multiple contracts are linked to the same library,
@@ -386,7 +393,7 @@ public final class DigiMe {
                         }
                     }
                 }
-            
+
             case .failure(let error):
                 resultQueue.async {
                     completion(error)
@@ -394,25 +401,31 @@ public final class DigiMe {
             }
         }
     }
-    
+
     /// Get a list of possible services a user can add to their digi.me.
     /// If contract identifier is specified, then only those services relevant to the contract are retrieved, otherwise all services are retrieved.
     ///
     /// - Parameters:
     ///   - contractId: The contract identifier for which relevant available services are retrieved. If `nil` then all services are retrieved.
+    ///   - filterAvailable: Filter all services by: “approved” && “production” && “available”
     ///   - resultQueue: The dispatch queue which the completion block will be called on. Defaults to main dispatch queue.
     ///   - completion: Block called upon completion with either the service list or any errors encountered
-    public func availableServices(contractId: String?, resultQueue: DispatchQueue = .main, completion: @escaping (Result<ServicesInfo, SDKError>) -> Void) {
+    public func availableServices(contractId: String?, filterAvailable: Bool = true, resultQueue: DispatchQueue = .main, completion: @escaping (Result<ServicesInfo, SDKError>) -> Void) {
         let route = ServicesRoute(contractId: contractId)
         apiClient.makeRequest(route) { result in
             switch result {
             case .success(let response):
-                let availableServices = response.data.services.filter { $0.isAvailable }
+                var availableServices = response.data.services
+
+                if filterAvailable {
+                    availableServices = availableServices.filter { $0.isAvailable }
+                }
+
                 let info = ServicesInfo(countries: response.data.countries, serviceGroups: response.data.serviceGroups, services: availableServices)
                 resultQueue.async {
                     completion(.success(info))
                 }
-                
+
             case .failure(let error):
                 resultQueue.async {
                     completion(.failure(error))
@@ -420,18 +433,144 @@ public final class DigiMe {
             }
         }
     }
-	
-	/// Clear cached data.
-	///
-	/// - Parameters:
-	///   - contractId: The contract identifier for which relevant available service
-	public func clearCachedData(for contractId: String) {
-		allFilesReader?.clearSessionData()
-		CredentialCache().clearCredentials(for: contractId)
-		SessionCache().clearSession(for: contractId)
-	}
-    
-	// MARK: - Private
+
+    /// Clear cached data.
+    ///
+    /// - Parameters:
+    ///   - contractId: The contract identifier for which relevant available service
+    public func clearCachedData(for contractId: String) {
+        allFilesReader?.clearSessionData()
+        CredentialCache().clearCredentials(for: contractId)
+        SessionCache().clearSession(for: contractId)
+    }
+
+    /// Get contract details.
+    /// If contract identifier is specified, then only those services relevant to the contract are retrieved, otherwise all services are retrieved.
+    ///
+    /// - Parameters:
+    ///   - resultQueue: The dispatch queue which the completion block will be called on. Defaults to main dispatch queue.
+    ///   - completion: Block called upon completion with either the contract object or any errors encountered
+    public func contractDetails(resultQueue: DispatchQueue = .main, completion: @escaping (Result<ContractVersion5, SDKError>) -> Void) {
+        guard
+            let session = session,
+            session.isValid else {
+            return completion(.failure(.invalidSession))
+        }
+
+        let route = ContractRoute(sessionKey: session.key, schemaVersion: "5.0.0")
+        apiClient.makeRequest(route) { result in
+            switch result {
+            case .success(let response):
+                resultQueue.async {
+                    self.certificateParser.parse(contractResponse: response) { result in
+                        completion(result)
+                    }
+                }
+
+            case .failure(let error):
+                resultQueue.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    public func clearData(for contractId: String) {
+        CredentialCache().clearCredentials(for: contractId)
+        SessionCache().clearSession(for: contractId)
+        ContractsCache().clearTimeRanges(for: contractId)
+    }
+
+    // MARK: - Apple Health
+
+    public func retrieveAppleHealth(for contractId: String, readOptions: ReadOptions? = nil, credentials: Credentials? = nil, resultQueue: DispatchQueue = .main, completion: @escaping (Result<HealthResult, SDKError>) -> Void) {
+
+        guard let contractTimeRange = contractsCache.firstTimeRange(for: contractId) else {
+
+            validateOrRefreshCredentials(credentials) { validationResult in
+                switch validationResult {
+                case .success(let refreshedCredentials):
+
+                    self.contractDetails(resultQueue: resultQueue) { contractResult in
+                        switch contractResult {
+                        case .success(let certificat):
+
+                            self.contractsCache.addTimeRanges(ranges: certificat.dataRequest?.timeRanges, for: contractId)
+                            let timeRangeResult = certificat.verifyTimeRange(readOptions: readOptions)
+                            switch timeRangeResult {
+                            case .success(let limits):
+                                self.healthDataClient.retrieveData(from: limits.startDate, to: limits.endDate) { result in
+                                    switch result {
+                                    case .success(var data):
+                                        data.refreshedCredentials = refreshedCredentials
+                                        resultQueue.async {
+                                            completion(.success(data))
+                                        }
+                                    case .failure(let error):
+                                        resultQueue.async {
+                                            completion(.failure(error))
+                                        }
+                                    }
+                                }
+                            case .failure(let error):
+                                resultQueue.async {
+                                    completion(.failure(error))
+                                }
+                            }
+
+                        case .failure(let error):
+                            resultQueue.async {
+                                completion(.failure(error))
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    resultQueue.async {
+                        completion(.failure(error))
+                    }
+                }
+            }
+
+            return
+        }
+
+        let timeRangeResult = contractTimeRange.verifyTimeRange(readOptions: readOptions)
+        switch timeRangeResult {
+        case .success(let limits):
+            self.healthDataClient.retrieveData(from: limits.startDate, to: limits.endDate) { result in
+                switch result {
+                case .success(let data):
+                    resultQueue.async {
+                        completion(.success(data))
+                    }
+                case .failure(let error):
+                    resultQueue.async {
+                        completion(.failure(error))
+                    }
+                }
+            }
+        case .failure(let error):
+            resultQueue.async {
+                completion(.failure(error))
+            }
+        }
+    }
+
+#if targetEnvironment(simulator)
+    public func saveHealthData(dataToSave: [HKObject], completion: @escaping (Result<Bool, SDKError>) -> Void) {
+        healthDataClient.saveHealthData(dataToSave) { success, error in
+            if success {
+                completion(.success(success))
+            }
+            else {
+                completion(.failure(.other))
+            }
+        }
+    }
+#endif
+
+    // MARK: - Private
+
     private func readAccounts(session: Session, completion: @escaping (Result<AccountsInfo, SDKError>) -> Void) {
         apiClient.makeRequest(ReadDataRoute(sessionKey: session.key, fileId: "accounts.json")) { result in
             switch result {
@@ -452,7 +591,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     private func write(data: Data, metadata: Data, credentials: Credentials, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
         uploadService.uploadFile(data: data, metadata: metadata, credentials: credentials) { result in
             switch result {
@@ -478,13 +617,13 @@ public final class DigiMe {
             }
         }
     }
-    
+
     // Auth - needs app to be able to receive response via URL
     private func beginAuth(serviceId: Int?, readOptions: ReadOptions?, linkToContractWithCredentials linkCredentials: Credentials?, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
-        
+
         // Ensure we don't have any session left over from previous
         session = nil
-                
+
         authService.requestPreAuthorizationCode(readOptions: readOptions, accessToken: linkCredentials?.token.accessToken.value) { result in
             switch result {
             case .success(let response):
@@ -495,13 +634,13 @@ public final class DigiMe {
             }
         }
     }
-    
+
     // Request read session by triggering source sync
     private func triggerSourceSync(credentials: Credentials, readOptions: ReadOptions?, completion: @escaping (Result<Void, SDKError>) -> Void) {
         guard let jwt = JWTUtility.dataTriggerRequestJWT(accessToken: credentials.token.accessToken.value, configuration: configuration) else {
             return completion(.failure(.errorCreatingRequestJwtToTriggerData))
         }
-        
+
         apiClient.makeRequest(TriggerSyncRoute(jwt: jwt, readOptions: readOptions)) { result in
             switch result {
             case .success(let response):
@@ -527,25 +666,25 @@ public final class DigiMe {
             }
         }
     }
-    
+
     private func validateOrRefreshCredentials(_ credentials: Credentials?, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
         // Check we have credentials
         guard let credentials = credentials else {
             return completion(.failure(SDKError.authorizationRequired))
         }
-        
+
         guard credentials.token.accessToken.isValid else {
             return refreshTokens(credentials: credentials, completion: completion)
         }
-        
+
         completion(.success(credentials))
     }
-    
+
     private func refreshTokens(credentials: Credentials, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
         guard credentials.token.refreshToken.isValid else {
             return reauthorize(accessToken: credentials.token.accessToken, completion: completion)
         }
-        
+
         authService.renewAccessToken(oauthToken: credentials.token) { result in
             switch result {
             case .success(let response):
@@ -557,7 +696,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     private func reauthorize(accessToken: OAuthToken.Token, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
         authService.requestPreAuthorizationCode(readOptions: nil, accessToken: accessToken.value) { result in
             switch result {
@@ -570,7 +709,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     private func performAuth(preAuthResponse: TokenSessionResponse, serviceId: Int?, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
         consentManager.requestUserConsent(preAuthCode: preAuthResponse.token, serviceId: serviceId) { result in
             switch result {
@@ -582,7 +721,7 @@ public final class DigiMe {
             }
         }
     }
-    
+
     private func exchangeToken(authResponse: ConsentResponse, completion: @escaping (Result<Credentials, SDKError>) -> Void) {
         authService.requestTokenExchange(authCode: authResponse.authorizationCode) { result in
             switch result {
@@ -595,22 +734,21 @@ public final class DigiMe {
             }
         }
     }
-    
+
     private func validateClient() -> SDKError? {
-		#if !DEBUG
         guard let urlTypes = Bundle.main.infoDictionary?["CFBundleURLTypes"] as? [[String: Any]] else {
             return SDKError.noUrlScheme
         }
-        
+
         let urlSchemes = urlTypes.compactMap { $0["CFBundleURLSchemes"] as? [String] }.flatMap { $0 }
         if !urlSchemes.contains("digime-ca-\(configuration.appId)") {
             return SDKError.noUrlScheme
         }
-        
+
         if configuration.appId == "YOUR_APP_ID" {
             return SDKError.invalidAppId
         }
-		#endif
+
         return nil
     }
 }
