@@ -7,7 +7,6 @@
 //
 
 import Foundation
-import HealthKit
 
 /// The entry point to the SDK
 public final class DigiMe {
@@ -21,11 +20,8 @@ public final class DigiMe {
     private let authService: OAuthService
     private let consentManager: ConsentManager
     private let sessionCache: SessionCache
-    private let contractsCache: ContractsCache
     private let apiClient: APIClient
     private let dataDecryptor: DataDecryptor
-    private let healthDataClient: HealthDataClient
-    private let certificateParser: CertificateParser
 
     private lazy var downloadService: FileDownloadService = {
         FileDownloadService(apiClient: apiClient, dataDecryptor: dataDecryptor)
@@ -69,14 +65,11 @@ public final class DigiMe {
     /// - Parameter configuration: The configuration which defines this instance
     public init(configuration: Configuration) {
         self.configuration = configuration
-        self.apiClient = APIClient()
+        self.apiClient = APIClient(with: configuration.baseUrl)
         self.authService = OAuthService(configuration: configuration, apiClient: apiClient)
         self.consentManager = ConsentManager(configuration: configuration)
         self.sessionCache = SessionCache()
-        self.contractsCache = ContractsCache()
         self.dataDecryptor = DataDecryptor(configuration: configuration)
-        self.healthDataClient = HealthDataClient(healthService: HealthDataService(account: HealthDataAccount().account))
-        self.certificateParser = CertificateParser()
     }
 
     /// Authorizes the contract configured with this digi.me instance to access to a library.
@@ -407,20 +400,14 @@ public final class DigiMe {
     ///
     /// - Parameters:
     ///   - contractId: The contract identifier for which relevant available services are retrieved. If `nil` then all services are retrieved.
-    ///   - filterAvailable: Filter all services by: “approved” && “production” && “available”
     ///   - resultQueue: The dispatch queue which the completion block will be called on. Defaults to main dispatch queue.
     ///   - completion: Block called upon completion with either the service list or any errors encountered
-    public func availableServices(contractId: String?, filterAvailable: Bool = true, resultQueue: DispatchQueue = .main, completion: @escaping (Result<ServicesInfo, SDKError>) -> Void) {
+    public func availableServices(contractId: String?, resultQueue: DispatchQueue = .main, completion: @escaping (Result<ServicesInfo, SDKError>) -> Void) {
         let route = ServicesRoute(contractId: contractId)
         apiClient.makeRequest(route) { result in
             switch result {
             case .success(let response):
-                var availableServices = response.data.services
-
-                if filterAvailable {
-                    availableServices = availableServices.filter { $0.isAvailable }
-                }
-
+                let availableServices = response.data.services.filter { $0.isAvailable }
                 let info = ServicesInfo(countries: response.data.countries, serviceGroups: response.data.serviceGroups, services: availableServices)
                 resultQueue.async {
                     completion(.success(info))
@@ -444,133 +431,7 @@ public final class DigiMe {
         SessionCache().clearSession(for: contractId)
     }
 
-    /// Get contract details.
-    /// If contract identifier is specified, then only those services relevant to the contract are retrieved, otherwise all services are retrieved.
-    ///
-    /// - Parameters:
-    ///   - resultQueue: The dispatch queue which the completion block will be called on. Defaults to main dispatch queue.
-    ///   - completion: Block called upon completion with either the contract object or any errors encountered
-    public func contractDetails(resultQueue: DispatchQueue = .main, completion: @escaping (Result<ContractVersion5, SDKError>) -> Void) {
-        guard
-            let session = session,
-            session.isValid else {
-            return completion(.failure(.invalidSession))
-        }
-
-        let route = ContractRoute(sessionKey: session.key, schemaVersion: "5.0.0")
-        apiClient.makeRequest(route) { result in
-            switch result {
-            case .success(let response):
-                resultQueue.async {
-                    self.certificateParser.parse(contractResponse: response) { result in
-                        completion(result)
-                    }
-                }
-
-            case .failure(let error):
-                resultQueue.async {
-                    completion(.failure(error))
-                }
-            }
-        }
-    }
-
-    public func clearData(for contractId: String) {
-        CredentialCache().clearCredentials(for: contractId)
-        SessionCache().clearSession(for: contractId)
-        ContractsCache().clearTimeRanges(for: contractId)
-    }
-
-    // MARK: - Apple Health
-
-    public func retrieveAppleHealth(for contractId: String, readOptions: ReadOptions? = nil, credentials: Credentials? = nil, resultQueue: DispatchQueue = .main, completion: @escaping (Result<HealthResult, SDKError>) -> Void) {
-
-        guard let contractTimeRange = contractsCache.firstTimeRange(for: contractId) else {
-
-            validateOrRefreshCredentials(credentials) { validationResult in
-                switch validationResult {
-                case .success(let refreshedCredentials):
-
-                    self.contractDetails(resultQueue: resultQueue) { contractResult in
-                        switch contractResult {
-                        case .success(let certificat):
-
-                            self.contractsCache.addTimeRanges(ranges: certificat.dataRequest?.timeRanges, for: contractId)
-                            let timeRangeResult = certificat.verifyTimeRange(readOptions: readOptions)
-                            switch timeRangeResult {
-                            case .success(let limits):
-                                self.healthDataClient.retrieveData(from: limits.startDate, to: limits.endDate) { result in
-                                    switch result {
-                                    case .success(var data):
-                                        data.refreshedCredentials = refreshedCredentials
-                                        resultQueue.async {
-                                            completion(.success(data))
-                                        }
-                                    case .failure(let error):
-                                        resultQueue.async {
-                                            completion(.failure(error))
-                                        }
-                                    }
-                                }
-                            case .failure(let error):
-                                resultQueue.async {
-                                    completion(.failure(error))
-                                }
-                            }
-
-                        case .failure(let error):
-                            resultQueue.async {
-                                completion(.failure(error))
-                            }
-                        }
-                    }
-                case .failure(let error):
-                    resultQueue.async {
-                        completion(.failure(error))
-                    }
-                }
-            }
-
-            return
-        }
-
-        let timeRangeResult = contractTimeRange.verifyTimeRange(readOptions: readOptions)
-        switch timeRangeResult {
-        case .success(let limits):
-            self.healthDataClient.retrieveData(from: limits.startDate, to: limits.endDate) { result in
-                switch result {
-                case .success(let data):
-                    resultQueue.async {
-                        completion(.success(data))
-                    }
-                case .failure(let error):
-                    resultQueue.async {
-                        completion(.failure(error))
-                    }
-                }
-            }
-        case .failure(let error):
-            resultQueue.async {
-                completion(.failure(error))
-            }
-        }
-    }
-
-#if targetEnvironment(simulator)
-    public func saveHealthData(dataToSave: [HKObject], completion: @escaping (Result<Bool, SDKError>) -> Void) {
-        healthDataClient.saveHealthData(dataToSave) { success, error in
-            if success {
-                completion(.success(success))
-            }
-            else {
-                completion(.failure(.other))
-            }
-        }
-    }
-#endif
-
     // MARK: - Private
-
     private func readAccounts(session: Session, completion: @escaping (Result<AccountsInfo, SDKError>) -> Void) {
         apiClient.makeRequest(ReadDataRoute(sessionKey: session.key, fileId: "accounts.json")) { result in
             switch result {
@@ -736,6 +597,7 @@ public final class DigiMe {
     }
 
     private func validateClient() -> SDKError? {
+#if !DEBUG
         guard let urlTypes = Bundle.main.infoDictionary?["CFBundleURLTypes"] as? [[String: Any]] else {
             return SDKError.noUrlScheme
         }
@@ -748,7 +610,7 @@ public final class DigiMe {
         if configuration.appId == "YOUR_APP_ID" {
             return SDKError.invalidAppId
         }
-
+#endif
         return nil
     }
 }
